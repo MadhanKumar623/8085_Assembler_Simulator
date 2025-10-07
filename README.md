@@ -1,4 +1,4 @@
-# 8085_codes
+# 8085_Assembler_Simulator
 
 Hi all,
 My name is Madhan kumar, I have done this C programming project as a part of the ECEN academy under the guidance of Balaji seshadree.
