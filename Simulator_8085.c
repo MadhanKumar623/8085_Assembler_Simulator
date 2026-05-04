@@ -1,6 +1,6 @@
 /**********************************8085 SIMULATOR************************************/
 
-/*NOTE_1: correctly update the flags for each instructions
+/*  NOTE_1: correctly update the flags for each instructions
     NOTE_2: If a register pair is storing the address means (e.g. B and C) MSB is stored in B and LSB is stored in C
                       e.g if address is 800AH means B = 80, C = 0A
     NOTE_3: 8085 simulator has 16 bit of address bus so memory can be indicated by 2 bytes
@@ -9,19 +9,38 @@
     NOTE_6: Use address as label during CALL and JUMP instructions
 */
 
-#include<stdio.h>
-#include<string.h>
-#include<stdlib.h>
-char memory[65536][15];                            //storing the memory contents,each of one byte
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <stdint.h>
+
+#define MEMORY_SIZE 65536
+#define MAX_LINES 1000
+#define MAX_LINE_LENGTH 128
+#define MAX_LABELS 300
+
+char memory[MEMORY_SIZE][15];                            //storing the memory contents,each of one byte
 int addr;                                                            //index value for each memory location,starting address of machine code address
-unsigned int A=0x12,B,C,D,E,H=0xAB,L=0x12,SP=0x5000;          //registers present in the 8085, stack pointer at 0x5000
+unsigned int A=0x00,B=0x00,C=0x00,D=0x00,E=0x00,H=0xAB,L=0x12,SP=0x5000;          //registers present in the 8085, stack pointer at 0x5000
 unsigned int ZF,SF,PF,CF,AC;                             //initially all flag bits are get reset to 0
 unsigned int flagRegister;                                         //containing all flag bits
 unsigned int PC;                                                           //program counter
 
-char str[100][20],f=0;
-int size[100];
+char str[MAX_LINES][MAX_LINE_LENGTH],f=0;
+int size[MAX_LINES];
 int len,len1;
+unsigned int program_start_addr;
+unsigned int program_end_addr;
+char ports[256][15];
+
+typedef struct {
+    char label[MAX_LINE_LENGTH];
+    unsigned int address;
+} Symbol;
+
+Symbol symbolTable[MAX_LABELS];
+int symbolCount = 0;
 char lut1[200][10] ={ "ADC A","ADC B","ADC C","ADC D","ADC E","ADC H","ADC L","ADC M",
                                          "ADD A","ADD B","ADD C","ADD D","ADD E","ADD H","ADD L","ADD M",
                                          "ANA A","ANA B","ANA C","ANA D","ANA E","ANA H","ANA L","ANA M",
@@ -55,7 +74,7 @@ char lut1[200][10] ={ "ADC A","ADC B","ADC C","ADC D","ADC E","ADC H","ADC L","A
 char lut2[200][7] =  { "8F","88","89","8A","8B","8C","8D","8E",
                                          "87","80","81","82","83","84","85","86",
                                          "A7","A0","A1","A2","A3","A4","A5","A6",
-                                         "BF","B8","B9","BA","BB","BC","BD","BD",
+                                         "BF","B8","B9","BA","BB","BC","BD","BE",
                                          "09","19","29","39",
                                          "3D","05","0D","15","1D","25","2D","35",
                                          "0B","1B","2B","3B",
@@ -101,7 +120,245 @@ char lut6[30][7] = {"DB","3A","2A","D3","22","32","01","11","21","31",
                                     "EA","F2","E2","CA"
                                    };
 
-char isPresent(char *s1,char *s2)          //check whether s1 is present in s2
+
+/* Removes leading and trailing white spaces from a string. */
+static void trimSpaces(char *line)
+{
+    char *start = line;
+    while (*start && isspace((unsigned char)*start)) start++;
+    if (start != line) memmove(line, start, strlen(start) + 1);
+
+    int end = (int)strlen(line) - 1;
+    while (end >= 0 && isspace((unsigned char)line[end])) line[end--] = '\0';
+}
+
+/* Converts text to uppercase in-place. */
+static void makeUpperCase(char *line)
+{
+    for (int i = 0; line[i]; i++) line[i] = (char)toupper((unsigned char)line[i]);
+}
+
+/* Removes comments, normalizes spacing, and allows flexible assembly input. */
+static void normalizeLine(char *line)
+{
+    char temp[MAX_LINE_LENGTH];
+    int j = 0;
+
+    line[strcspn(line, "\r\n")] = '\0';
+    char *comment = strchr(line, ';');
+    if (comment) *comment = '\0';
+    makeUpperCase(line);
+    trimSpaces(line);
+
+    for (int i = 0; line[i] && j < MAX_LINE_LENGTH - 1; i++) {
+        char ch = line[i];
+        if (ch == '\t') ch = ' ';
+
+        if (ch == ',') {
+            while (j > 0 && temp[j - 1] == ' ') j--;
+            temp[j++] = ',';
+            while (line[i + 1] == ' ' || line[i + 1] == '\t') i++;
+        } else if (isspace((unsigned char)ch)) {
+            if (j > 0 && temp[j - 1] != ' ' && temp[j - 1] != ',') temp[j++] = ' ';
+        } else {
+            temp[j++] = ch;
+        }
+    }
+    temp[j] = '\0';
+    strcpy(line, temp);
+    trimSpaces(line);
+}
+
+/* Finds whether a line starts with a complete mnemonic/prefix. */
+static int startsWithMnemonic(const char *line, const char *mnemonic)
+{
+    size_t n = strlen(mnemonic);
+    if (strncmp(line, mnemonic, n) != 0) return 0;
+    return line[n] == '\0' || line[n] == ' ' || line[n] == ',';
+}
+
+/* Parses hex/decimal operands such as 25H, 0x25, 25, or label names. */
+static int parseValue(const char *token, unsigned int *value)
+{
+    char buf[MAX_LINE_LENGTH];
+    char *endptr;
+    int base = 10;
+
+    if (token == NULL || value == NULL) return 0;
+    strncpy(buf, token, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    trimSpaces(buf);
+    if (buf[0] == '\0') return 0;
+
+    if (buf[0] == '#') memmove(buf, buf + 1, strlen(buf));
+    if (buf[0] == '$') {
+        memmove(buf, buf + 1, strlen(buf));
+        base = 16;
+    }
+
+    int lenBuf = (int)strlen(buf);
+    if (lenBuf > 0 && buf[lenBuf - 1] == 'H') {
+        buf[lenBuf - 1] = '\0';
+        base = 16;
+    } else if (lenBuf > 1 && buf[0] == '0' && buf[1] == 'X') {
+        base = 16;
+    }
+
+    *value = (unsigned int)strtoul(buf, &endptr, base);
+    if (endptr && *endptr == '\0') return 1;
+
+    for (int i = 0; i < symbolCount; i++) {
+        if (strcmp(buf, symbolTable[i].label) == 0) {
+            *value = symbolTable[i].address;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Writes one byte of machine code into simulator memory. */
+static void emitByte(unsigned int byteValue)
+{
+    if (addr < 0 || addr >= MEMORY_SIZE) {
+        printf("ERROR: Address out of range while writing machine code.\n");
+        f = 0;
+        return;
+    }
+    sprintf(memory[addr++], "%02X", byteValue & 0xFF);
+}
+
+/* Writes a 16-bit value in 8085 little-endian order. */
+static void emitWordLittleEndian(unsigned int value)
+{
+    emitByte(value & 0xFF);
+    emitByte((value >> 8) & 0xFF);
+}
+
+/* Removes an optional LABEL: prefix from an assembly line. */
+static void removeLabel(char *line)
+{
+    char *colon = strchr(line, ':');
+    if (colon) {
+        memmove(line, colon + 1, strlen(colon + 1) + 1);
+        trimSpaces(line);
+    }
+}
+
+/* Adds a label and its resolved address into the symbol table. */
+static void addSymbol(const char *label, unsigned int address)
+{
+    if (symbolCount >= MAX_LABELS) {
+        printf("ERROR: Too many labels. Increase MAX_LABELS.\n");
+        return;
+    }
+
+    for (int i = 0; i < symbolCount; i++) {
+        if (strcmp(symbolTable[i].label, label) == 0) {
+            symbolTable[i].address = address;
+            return;
+        }
+    }
+
+    strncpy(symbolTable[symbolCount].label, label, MAX_LINE_LENGTH - 1);
+    symbolTable[symbolCount].label[MAX_LINE_LENGTH - 1] = '\0';
+    symbolTable[symbolCount].address = address;
+    symbolCount++;
+}
+
+/* Counts comma-separated DB operands. */
+static int countDbBytes(const char *operands)
+{
+    char buf[MAX_LINE_LENGTH];
+    int count = 0;
+    strncpy(buf, operands, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *token = strtok(buf, ",");
+    while (token != NULL) {
+        trimSpaces(token);
+        if (token[0] != '\0') count++;
+        token = strtok(NULL, ",");
+    }
+    return count;
+}
+
+/* Estimates instruction size for the assembler first pass. */
+static int instructionSize(char *line)
+{
+    char temp[MAX_LINE_LENGTH];
+    strncpy(temp, line, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+    normalizeLine(temp);
+    removeLabel(temp);
+    if (temp[0] == '\0') return 0;
+
+    if (startsWithMnemonic(temp, "ORG")) return 0;
+    if (strstr(temp, " EQU ") != NULL) return 0;
+    if (startsWithMnemonic(temp, "DB")) return countDbBytes(temp + 2);
+
+    for (int i = 0; i < 200; i++) {
+        if (lut1[i][0] != '\0' && strcmp(temp, lut1[i]) == 0) return 1;
+    }
+    for (int i = 0; i < 16; i++) {
+        if (lut3[i][0] != '\0' && startsWithMnemonic(temp, lut3[i])) return 2;
+    }
+    if (startsWithMnemonic(temp, "IN") || startsWithMnemonic(temp, "OUT")) return 2;
+    for (int i = 0; i < 30; i++) {
+        if (lut5[i][0] != '\0' && strcmp(lut5[i], "IN") != 0 && strcmp(lut5[i], "OUT") != 0 && startsWithMnemonic(temp, lut5[i])) return 3;
+    }
+    return 0;
+}
+
+/* Builds label addresses before machine-code generation. */
+static void buildSymbolTable(unsigned int startAddress)
+{
+    unsigned int currentAddress = startAddress;
+    symbolCount = 0;
+
+    for (int i = 0; i < len; i++) {
+        char line[MAX_LINE_LENGTH];
+        strncpy(line, str[i], sizeof(line) - 1);
+        line[sizeof(line) - 1] = '\0';
+        normalizeLine(line);
+        if (line[0] == '\0') continue;
+
+        char *equ = strstr(line, " EQU ");
+        if (equ) {
+            char label[MAX_LINE_LENGTH];
+            unsigned int equValue;
+            size_t labelLen = (size_t)(equ - line);
+            if (labelLen >= sizeof(label)) labelLen = sizeof(label) - 1;
+            strncpy(label, line, labelLen);
+            label[labelLen] = '\0';
+            trimSpaces(label);
+            if (parseValue(equ + 5, &equValue)) addSymbol(label, equValue & 0xFFFF);
+            continue;
+        }
+
+        char *colon = strchr(line, ':');
+        if (colon) {
+            char label[MAX_LINE_LENGTH];
+            size_t labelLen = (size_t)(colon - line);
+            if (labelLen >= sizeof(label)) labelLen = sizeof(label) - 1;
+            strncpy(label, line, labelLen);
+            label[labelLen] = '\0';
+            trimSpaces(label);
+            if (label[0] != '\0') addSymbol(label, currentAddress);
+            memmove(line, colon + 1, strlen(colon + 1) + 1);
+            trimSpaces(line);
+        }
+
+        if (startsWithMnemonic(line, "ORG")) {
+            unsigned int newAddress;
+            if (parseValue(line + 3, &newAddress)) currentAddress = newAddress & 0xFFFF;
+            continue;
+        }
+        currentAddress += (unsigned int)instructionSize(line);
+    }
+}
+
+/* Checks whether one string is present inside another string. */
+char isPresent(char *s1,char *s2)
 {
     int M = strlen(s1);
     int N = strlen(s2);
@@ -115,6 +372,7 @@ char isPresent(char *s1,char *s2)          //check whether s1 is present in s2
     }
     return 0;
 }
+/* Pushes a 16-bit value on the simulated stack. */
 void push(unsigned int x)
 {
       char string[10];
@@ -125,6 +383,7 @@ void push(unsigned int x)
       sprintf(string,"%02x",(x&0xFF));
       strcpy(memory[SP],string);
 }
+/* Pops a 16-bit return address from the simulated stack. */
 void pop()
 {
        unsigned int dec2 = strtol(memory[SP],NULL,16);
@@ -133,8 +392,9 @@ void pop()
        dec2 = strtol(memory[SP],NULL,16);
        SP++;
        unsigned int tH = (dec2<<8)&0xFF00;
-       PC = tH|tL;                                         //copying stack top address to PC
+       PC = ((tH|tL) - 1) & 0xFFFF;                   //copying stack top address to PC
 }
+/* Swaps two unsigned integer values. */
 void swap(unsigned int *a,unsigned int *b)
 {
      unsigned int tmp;
@@ -142,6 +402,7 @@ void swap(unsigned int *a,unsigned int *b)
      *a = *b;
      *b = tmp;
 }
+/* Returns 1 when the lower 8 bits have even parity. */
 char checkParity(unsigned int n)
 {
     int count = 0;
@@ -153,6 +414,7 @@ char checkParity(unsigned int n)
     if(count%2==0) return 1;
     else return 0;
 }
+/* Updates auxiliary carry/borrow for subtraction. */
 void calculateAuxilaryCarry_sub(unsigned int a,unsigned int b)
 {
     unsigned char nibble1 = a&0x0F;
@@ -160,36 +422,40 @@ void calculateAuxilaryCarry_sub(unsigned int a,unsigned int b)
     unsigned char nibbleSum = nibble1 - nibble2;
     AC = (nibbleSum&0x10)?1:0;
 }
-void calculateAuxilaryCarry(unsigned int a,unsigned int b)    //function for checking auxilary carry
+/* Updates auxiliary carry for addition. */
+void calculateAuxilaryCarry(unsigned int a,unsigned int b)
 {
     unsigned char nibble1 = a&0x0F;
     unsigned char nibble2 = b&0x0F;
     unsigned char nibbleSum = nibble1 + nibble2;
     AC = (nibbleSum&0x10)?1:0;
 }
-void flagStatusUpdate(unsigned int a)   //int size is 4 bytes(e.g  0x1234)
+/* Updates 8085 flags after arithmetic/logical operations. */
+void flagStatusUpdate(unsigned int a)
 {
     if((a&0x0100)==0x0100) CF = 1;
     else CF = 0;
     if((a&0x80)==0x80) SF = 1;
     else SF = 0;
-    if(a==0) ZF = 1;
+    if((a&0xFF)==0) ZF = 1;
     else ZF = 0;
     if(checkParity(a)==1) PF = 1;
     else PF = 0;
     flagRegister = (SF<<7)|(ZF<<6)|(AC<<4)|(PF<<2)|(CF);     //updating flag register
 }
-void DCRflagStatusUpdate(unsigned int a)    //except carry flag all will get affected
+/* Updates flags for INR/DCR while preserving carry. */
+void DCRflagStatusUpdate(unsigned int a)
 {                                                                                       //used for updating flags during INR and DCR operations
     if((a&0x80)==0x80) SF = 1;
     else SF = 0;
-    if(a==0) ZF = 1;
+    if((a&0xFF)==0) ZF = 1;
     else ZF = 0;
     if(checkParity(a)==1) PF = 1;
     else PF = 0;
     flagRegister = (SF<<7)|(ZF<<6)|(AC<<4)|(PF<<2)|(CF);     //updating flag register
 }
-void CMPflagStatusUpdate(unsigned int k)           //used only for CMP instruction
+/* Updates flags for CMP without changing accumulator. */
+void CMPflagStatusUpdate(unsigned int k)
 {
     if(A<k) {
             CF = 1;
@@ -208,75 +474,165 @@ void CMPflagStatusUpdate(unsigned int k)           //used only for CMP instructi
     }
     flagRegister = (SF<<7)|(ZF<<6)|(AC<<4)|(PF<<2)|(CF);     //updating flag register
 }
+/* Converts one-byte 8085 instructions into machine code. */
 void getMachineCode_1(char *ptr,int length)
 {
-    char s1[5],s2[5],c=1;
-    int i,flag=0;
-    for(i=0;i<200;i++)
+    (void)length;
+    char line[MAX_LINE_LENGTH];
+    strncpy(line, ptr, sizeof(line) - 1);
+    line[sizeof(line) - 1] = '\0';
+    normalizeLine(line);
+    removeLabel(line);
+
+    if (line[0] == '\0' || startsWithMnemonic(line, "ORG") || strstr(line, " EQU ") != NULL) {
+        f = 1;
+        return;
+    }
+
+    for(int i = 0; i < 200; i++)
     {
-        if(strcmp(ptr,lut1[i])==0) {
-                flag = 1;
-                break;
+        if(lut1[i][0] != '\0' && strcmp(line,lut1[i])==0) {
+            printf("%s\n",lut2[i]);
+            emitByte((unsigned int)strtoul(lut2[i], NULL, 16));
+            f = 1;
+            return;
         }
     }
-    if(flag==1){
-         printf("%s\n",lut2[i]);
-         strcpy(memory[addr++],lut2[i]);
-         f = 1;
-    }
-    else if(flag==0) return;
 }
+
+/* Converts 8-bit immediate 8085 instructions into machine code. */
 void getMachineCode_2(char *ptr,int length)
 {
-    char str1[3],i,flag=0,c=1;
-    char s1[5],s2[7];
-    unsigned int temp;
-    str1[2] = '\0';
-    for(i=0;i<15;i++){
-        if(isPresent(lut3[i],ptr))
+    (void)length;
+    char line[MAX_LINE_LENGTH];
+    char operand[MAX_LINE_LENGTH];
+    unsigned int value;
+
+    strncpy(line, ptr, sizeof(line) - 1);
+    line[sizeof(line) - 1] = '\0';
+    normalizeLine(line);
+    removeLabel(line);
+
+    for(int i = 0; i < 16; i++){
+        if(lut3[i][0] != '\0' && startsWithMnemonic(line,lut3[i]))
         {
-             str1[1] = ptr[length-2];
-             str1[0] = ptr[length-3];
-             flag = 1;
-             break;
+            const char *op = line + strlen(lut3[i]);
+            while (*op == ' ' || *op == ',') op++;
+            strncpy(operand, op, sizeof(operand) - 1);
+            operand[sizeof(operand) - 1] = '\0';
+            trimSpaces(operand);
+
+            if (!parseValue(operand, &value) || value > 0xFF) {
+                printf("ERROR: Invalid 8-bit operand '%s' in '%s'\n", operand, line);
+                f = 0;
+                return;
+            }
+
+            printf("%s  %02X\n",lut4[i],value & 0xFF);
+            emitByte((unsigned int)strtoul(lut4[i], NULL, 16));
+            emitByte(value);
+            len1++;
+            f = 1;
+            return;
         }
     }
-    if(flag==1){
-        printf("%s  %s\n",lut4[i],str1);
-        strcpy(memory[addr++],lut4[i]);
-        strcpy(memory[addr++],str1);
-        len1++;
-        f = 1;
-    }
-    else if(flag==0) return;
 }
+
+/* Converts directives, I/O, and 16-bit operand instructions into machine code. */
 void getMachineCode_3(char *ptr,int length)
 {
-    char str1[3],str2[3],i,flag=0,c=1;
-    char s1[7],s2[7];
-    unsigned int temp;
-    str1[2] = '\0'; str2[2] = '\0';
-    for(i=0;i<30;i++){
-        if(isPresent(lut5[i],ptr))
+    (void)length;
+    char line[MAX_LINE_LENGTH];
+    char operand[MAX_LINE_LENGTH];
+    unsigned int value;
+
+    strncpy(line, ptr, sizeof(line) - 1);
+    line[sizeof(line) - 1] = '\0';
+    normalizeLine(line);
+    removeLabel(line);
+
+    if (line[0] == '\0') {
+        f = 1;
+        return;
+    }
+
+    if (startsWithMnemonic(line, "ORG")) {
+        if (parseValue(line + 3, &value)) {
+            addr = (int)(value & 0xFFFF);
+            f = 1;
+        }
+        return;
+    }
+
+    if (startsWithMnemonic(line, "DB")) {
+        char dbcopy[MAX_LINE_LENGTH];
+        strncpy(dbcopy, line + 2, sizeof(dbcopy) - 1);
+        dbcopy[sizeof(dbcopy) - 1] = '\0';
+        char *token = strtok(dbcopy, ",");
+        int emitted = 0;
+        while (token != NULL) {
+            trimSpaces(token);
+            if (!parseValue(token, &value) || value > 0xFF) {
+                printf("ERROR: Invalid DB byte '%s'\n", token);
+                f = 0;
+                return;
+            }
+            printf("%02X\n", value & 0xFF);
+            emitByte(value);
+            emitted++;
+            token = strtok(NULL, ",");
+        }
+        len1 += emitted;
+        f = 1;
+        return;
+    }
+
+    if (startsWithMnemonic(line, "IN") || startsWithMnemonic(line, "OUT")) {
+        const char *opcode = startsWithMnemonic(line, "IN") ? "DB" : "D3";
+        const char *op = line + (line[1] == 'N' ? 2 : 3);
+        while (*op == ' ' || *op == ',') op++;
+        strncpy(operand, op, sizeof(operand) - 1);
+        operand[sizeof(operand) - 1] = '\0';
+        trimSpaces(operand);
+        if (!parseValue(operand, &value) || value > 0xFF) {
+            printf("ERROR: Invalid port operand '%s' in '%s'\n", operand, line);
+            f = 0;
+            return;
+        }
+        printf("%s  %02X\n", opcode, value & 0xFF);
+        emitByte((unsigned int)strtoul(opcode, NULL, 16));
+        emitByte(value);
+        len1++;
+        f = 1;
+        return;
+    }
+
+    for(int i = 0; i < 30; i++){
+        if(lut5[i][0] != '\0' && strcmp(lut5[i], "IN") != 0 && strcmp(lut5[i], "OUT") != 0 && startsWithMnemonic(line,lut5[i]))
         {
-             str2[1] = ptr[length-2];
-             str2[0] = ptr[length-3];
-             str1[1] = ptr[length-4];
-             str1[0] = ptr[length-5];
-             flag = 1;
-             break;
+            const char *op = line + strlen(lut5[i]);
+            while (*op == ' ' || *op == ',') op++;
+            strncpy(operand, op, sizeof(operand) - 1);
+            operand[sizeof(operand) - 1] = '\0';
+            trimSpaces(operand);
+
+            if (!parseValue(operand, &value) || value > 0xFFFF) {
+                printf("ERROR: Invalid 16-bit operand/label '%s' in '%s'\n", operand, line);
+                f = 0;
+                return;
+            }
+
+            printf("%s  %02X  %02X\n",lut6[i],value & 0xFF,(value >> 8) & 0xFF);
+            emitByte((unsigned int)strtoul(lut6[i], NULL, 16));
+            emitWordLittleEndian(value);
+            len1 = len1+2;
+            f = 1;
+            return;
         }
     }
-    if(flag==1){
-        printf("%s  %s  %s\n",lut6[i],str2,str1);
-        strcpy(memory[addr++],lut6[i]);
-        strcpy(memory[addr++],str2);
-        strcpy(memory[addr++],str1);
-        len1 = len1+2;
-        f = 1;
-    }
-    else if(flag==0) return;
 }
+
+/* Prints simulator usage information. */
 void init_messages()
 {
     printf("XXX-------------------------------------------------8085 SIMULATOR-------------------------------------------------XXX\n\n");
@@ -288,64 +644,105 @@ void init_messages()
     printf("3. You could able to see only the final status of the registers and flags\n");
     printf("4. Follow the Little endian format while storing in memory\n\n");
 }
+/* Program entry point: loads memory, assembles input, and runs simulation. */
 int main()
 {
-    char temp[20],i,y=0;
-    int tmp;
-    for(int i=0;i<65536;i++) strcpy(memory[i],"00");
+    char temp[MAX_LINE_LENGTH];
+    int tmp = 0;
+    (void)tmp;
+
+    for(int mi=0; mi<MEMORY_SIZE; mi++) strcpy(memory[mi],"00");
+    for(int pi=0; pi<256; pi++) strcpy(ports[pi],"00");
+
     init_messages();
     printf("---------------------------------------------------------------------------------------------------------");
-    printf("\nENTER THE VALUES TO BE STORED IN MEMORY LOCATION (enter NIL if not any and enter to END to terminate):\n");
+    printf("\nENTER THE VALUES TO BE STORED IN MEMORY LOCATION (enter NIL if not any and enter END to terminate):\n");
     printf("---------------------------------------------------------------------------------------------------------");
     printf("\nFor e.g\n0012H  23\nC301H  1A\n\n");
-    while(1)
+
+    while(fgets(temp, sizeof(temp), stdin) != NULL)
     {
-        char c=1;
-        int n1;
-        scanf("%[^\n]",temp);
-        getchar();
-        if(strcmp(temp,"END")==0||strcmp(temp,"NIL")==0) break;
-        else{
-              char *token = strtok(temp,"  ");
-              while(token!=NULL){
-                   if(c==1){
-                       c++;
-                       n1 = strtol(token,NULL,16);
-                   }
-                   else if(c==2) strcpy(memory[n1],token);
-                   token = strtok(NULL,"  ");
-              }
+        char line[MAX_LINE_LENGTH];
+        char addressToken[MAX_LINE_LENGTH], valueToken[MAX_LINE_LENGTH];
+        unsigned int n1, n2;
+
+        strncpy(line, temp, sizeof(line) - 1);
+        line[sizeof(line) - 1] = '\0';
+        normalizeLine(line);
+        if(line[0] == '\0') continue;
+        if(strcmp(line,"END")==0 || strcmp(line,"NIL")==0) break;
+
+        addressToken[0] = valueToken[0] = '\0';
+        sscanf(line, "%127s %127s", addressToken, valueToken);
+        if(parseValue(addressToken, &n1) && parseValue(valueToken, &n2) && n1 < MEMORY_SIZE && n2 <= 0xFF) {
+            sprintf(memory[n1], "%02X", n2 & 0xFF);
+        } else {
+            printf("WARNING: Ignored invalid memory initialization line: %s\n", line);
         }
     }
+
     printf("---------------------------------------------------------------------------------------------------------");
-    printf("\nENTER THE ASSEMBLY CODE (all in upper case only):\n");
+    printf("\nENTER THE ASSEMBLY CODE:\n");
     printf("---------------------------------------------------------------------------------------------------------");
-    printf("\nFor e.g\nMOV x,y\nSBB x\nMVI x,96H\n\n");
+    printf("\nAccepted examples:\nMOV A,B\nMVI A,96H\nloop: DCR B\nJNZ loop\nDB 01H, 02H\n\n");
     printf("---------------------------------------------------------------------------------------------------------");
-    printf("\nSTART WITH ANY ORGINATING ADDRESS (e.g., ORG 2000H) & TERMINATE WITH END\n");
+    printf("\nSTART WITH ORG 2000H OR directly type code. TERMINATE WITH END\n");
     printf("---------------------------------------------------------------------------------------------------------\n");
-    while(1)
+
+    len = 0;
+    addr = 0;
+    program_start_addr = 0;
+    int originFound = 0;
+
+    while(fgets(temp, sizeof(temp), stdin) != NULL)
     {
-        if(y==0){
-            y++;
-            scanf("ORG %xH",&addr);
-            getchar();
+        char line[MAX_LINE_LENGTH];
+        unsigned int origin;
+
+        strncpy(line, temp, sizeof(line) - 1);
+        line[sizeof(line) - 1] = '\0';
+        normalizeLine(line);
+        if(line[0] == '\0') continue;
+        if(strcmp(line,"END")==0) break;
+
+        if(startsWithMnemonic(line, "ORG")) {
+            if(parseValue(line + 3, &origin)) {
+                addr = (int)(origin & 0xFFFF);
+                if(!originFound) program_start_addr = origin & 0xFFFF;
+                originFound = 1;
+            } else {
+                printf("ERROR: Invalid ORG line: %s\n", line);
+                return 1;
+            }
+            continue;
         }
-        else{
-       scanf("%[^\n]%n",temp,&tmp);
-       getchar();
-       if(strcmp(temp,"END")==0) break;
-       else {
-            strcpy(str[len],temp);
-            size[len++] = tmp;
-         }
-      }
-   }
-   len1 = len;
-   printf("\n---------------------------------------------------------------------------------------------------------");
-   printf("\nEQUIVALENT MACHINE CODE\n");
-   printf("---------------------------------------------------------------------------------------------------------\n");
-    for(i=0;i<len;i++)
+
+        if(!originFound) {
+            addr = 0;
+            program_start_addr = 0;
+            originFound = 1;
+        }
+
+        if(len >= MAX_LINES) {
+            printf("ERROR: Too many assembly lines. Increase MAX_LINES.\n");
+            return 1;
+        }
+        strncpy(str[len], line, MAX_LINE_LENGTH - 1);
+        str[len][MAX_LINE_LENGTH - 1] = '\0';
+        size[len] = (int)strlen(str[len]);
+        len++;
+    }
+
+    buildSymbolTable(program_start_addr);
+    addr = (int)program_start_addr;
+    len1 = 0;
+
+    printf("\n---------------------------------------------------------------------------------------------------------");
+    printf("\nEQUIVALENT MACHINE CODE\n");
+    printf("---------------------------------------------------------------------------------------------------------\n");
+
+    int assembly_error = 0;
+    for(int i=0;i<len;i++)
     {
          f = 0;
          getMachineCode_1(str[i],size[i]);
@@ -354,16 +751,21 @@ int main()
          if(f==0)  getMachineCode_3(str[i],size[i]);
          else if(f==1) continue;
          if(f==0){
-               printf("ENTER VALID ASSEMBLY CODE!!\n");
+               printf("ENTER VALID ASSEMBLY CODE near line %d: %s\n", i + 1, str[i]);
+               assembly_error = 1;
                break;
         }
     }
+    if (assembly_error) return 1;
+
+    program_end_addr = (unsigned int)addr;
+
     printf("\n---------------------------------------------------------------------------------------------------------");
     printf("\nCODE MEMORY IS SHOWN BELOW\n");
     printf("---------------------------------------------------------------------------------------------------------\n");
-    for(int i=addr-len1;i<addr;i++) printf("%04x       %s\n",i,memory[i]);
-    PC = addr-len1;
-    for(PC;PC<addr;PC++)                                  //starting from the Program counter (PC)
+    for(unsigned int mi=program_start_addr; mi<(unsigned int)addr; mi++) printf("%04X       %s\n",mi,memory[mi]);
+    PC = program_start_addr;
+    for(;PC<(unsigned int)addr;PC++)                                  //starting from the Program counter (PC)
     {
         //start of ADC operations
         if(strcmp(memory[PC],"8F")==0){
@@ -540,7 +942,7 @@ int main()
          else if(strcmp(memory[PC],"BB")==0) CMPflagStatusUpdate(E);
          else if(strcmp(memory[PC],"BC")==0) CMPflagStatusUpdate(H);
          else if(strcmp(memory[PC],"BD")==0) CMPflagStatusUpdate(L);
-         else if(strcmp(memory[PC],"BD")==0) {
+         else if(strcmp(memory[PC],"BE")==0) {
              char string[10];
              sprintf(string,"%02x%02x",H,L);          //combining two characters as string
              int dec = strtol(string,NULL,16);   //converting string to hex
@@ -857,106 +1259,106 @@ int main()
                 sprintf(string,"%02x%02x",H,L);          //combining two characters as string
                 int dec = strtol(string,NULL,16);          //converting string to hex
                 unsigned int dec2 = strtol(memory[dec],NULL,16);    //getting data from the memory location(memory[dec])
-                D = dec2&0xFF;
+                L = dec2&0xFF;
         }
         else if(strcmp(memory[PC],"77")==0){
                 char string[10];
                 sprintf(string,"%02x%02x",H,L);          //combining two characters as string
                 int dec = strtol(string,NULL,16);
-                sprintf(string,"%x",A);                       //writing back to memory
+                sprintf(string,"%02x",A&0xFF);                       //writing back to memory
                 strcpy(memory[dec],string);            //M = A
         }
         else if(strcmp(memory[PC],"70")==0){
                 char string[10];
                 sprintf(string,"%02x%02x",H,L);          //combining two characters as string
                 int dec = strtol(string,NULL,16);
-                sprintf(string,"%x",B);                       //writing back to memory
+                sprintf(string,"%02x",B&0xFF);                       //writing back to memory
                 strcpy(memory[dec],string);            //M = B
         }
         else if(strcmp(memory[PC],"71")==0){
                 char string[10];
                 sprintf(string,"%02x%02x",H,L);          //combining two characters as string
                 int dec = strtol(string,NULL,16);
-                sprintf(string,"%x",C);                       //writing back to memory
+                sprintf(string,"%02x",C&0xFF);                       //writing back to memory
                 strcpy(memory[dec],string);            //M = C
         }
         else if(strcmp(memory[PC],"72")==0){
                 char string[10];
                 sprintf(string,"%02x%02x",H,L);          //combining two characters as string
                 int dec = strtol(string,NULL,16);
-                sprintf(string,"%x",D);                       //writing back to memory
+                sprintf(string,"%02x",D&0xFF);                       //writing back to memory
                 strcpy(memory[dec],string);            //M = D
         }
         else if(strcmp(memory[PC],"73")==0){
                 char string[10];
                 sprintf(string,"%02x%02x",H,L);          //combining two characters as string
                 int dec = strtol(string,NULL,16);
-                sprintf(string,"%x",E);                       //writing back to memory
+                sprintf(string,"%02x",E&0xFF);                       //writing back to memory
                 strcpy(memory[dec],string);            //M = E
         }
         else if(strcmp(memory[PC],"74")==0){
                 char string[10];
                 sprintf(string,"%02x%02x",H,L);          //combining two characters as string
                 int dec = strtol(string,NULL,16);
-                sprintf(string,"%x",H);                       //writing back to memory
+                sprintf(string,"%02x",H&0xFF);                       //writing back to memory
                 strcpy(memory[dec],string);            //M = H
         }
         else if(strcmp(memory[PC],"75")==0){
                 char string[10];
                 sprintf(string,"%02x%02x",H,L);          //combining two characters as string
                 int dec = strtol(string,NULL,16);
-                sprintf(string,"%x",L);                       //writing back to memory
+                sprintf(string,"%02x",L&0xFF);                       //writing back to memory
                 strcpy(memory[dec],string);            //M = L
         }
         //for ORA
         else if(strcmp(memory[PC],"B7")==0){
                  AC = 0;
                  CF = 0;
-                  A = A|A;
-                  flagStatusUpdate(A);
-                  A = A&0xFF;
+                 A = A|A;
+                 flagStatusUpdate(A);
+                 A = A&0xFF;
         }
-        else if(strcmp(memory[PC],"B7")==0){
+        else if(strcmp(memory[PC],"B0")==0){
                  AC = 0;
                  CF = 0;
-                  B = A|B;
-                  flagStatusUpdate(B);
-                  B = B&0xFF;
+                 A = A|B;
+                 flagStatusUpdate(A);
+                 A = A&0xFF;
         }
         else if(strcmp(memory[PC],"B1")==0){
                   AC = 0;
                   CF = 0;
-                  C = A|C;
-                  flagStatusUpdate(C);
-                  C = C&0xFF;
+                  A = A|C;
+                  flagStatusUpdate(A);
+                  A = A&0xFF;
         }
         else if(strcmp(memory[PC],"B2")==0){
                   AC = 0;
                   CF = 0;
-                  D = A|D;
-                  flagStatusUpdate(D);
-                  D = D&0xFF;
+                  A = A|D;
+                  flagStatusUpdate(A);
+                  A = A&0xFF;
         }
         else if(strcmp(memory[PC],"B3")==0){
                   AC = 0;
                   CF = 0;
-                  E = A|E;
-                  flagStatusUpdate(E);
-                  E = E&0xFF;
+                  A = A|E;
+                  flagStatusUpdate(A);
+                  A = A&0xFF;
         }
         else if(strcmp(memory[PC],"B4")==0){
                   AC = 0;
                   CF = 0;
-                  H = A|H;
-                  flagStatusUpdate(H);
-                  H = H&0xFF;
+                  A = A|H;
+                  flagStatusUpdate(A);
+                  A = A&0xFF;
         }
         else if(strcmp(memory[PC],"B5")==0){
                   AC = 0;
                   CF = 0;
-                  L = A|L;
-                  flagStatusUpdate(L);
-                  L = L&0xFF;
+                  A = A|L;
+                  flagStatusUpdate(A);
+                  A = A&0xFF;
         }
         else if(strcmp(memory[PC],"B6")==0){
                  AC = 0;
@@ -965,44 +1367,42 @@ int main()
                  sprintf(string,"%02x%02x",H,L);          //combining two characters as string
                  int dec = strtol(string,NULL,16);          //converting string to hex
                  unsigned int dec2 = strtol(memory[dec],NULL,16);
-                 dec2 = A|dec2;
-                 flagStatusUpdate(dec2);
-                 dec2 = dec2&0xFF;
-                 sprintf(string,"%x",dec2);
-                 strcpy(memory[dec],string);
+                 A = A|dec2;
+                 flagStatusUpdate(A);
+                 A = A&0xFF;
         }
         //for POP
         else if(strcmp(memory[PC],"C1")==0){
                  unsigned int dec2 = strtol(memory[SP],NULL,16);
                  SP++;
-                 B = dec2&0xFF;
+                 C = dec2&0xFF;
                  dec2 = strtol(memory[SP],NULL,16);
                  SP++;
-                 C = dec2&0xFF;
+                 B = dec2&0xFF;
             }
         else if(strcmp(memory[PC],"D1")==0){
                  unsigned int dec2 = strtol(memory[SP],NULL,16);
                  SP++;
-                 D = dec2&0xFF;
+                 E = dec2&0xFF;
                  dec2 = strtol(memory[SP],NULL,16);
                  SP++;
-                 E = dec2&0xFF;
+                 D = dec2&0xFF;
         }
         else if(strcmp(memory[PC],"E1")==0){
                  unsigned int dec2 = strtol(memory[SP],NULL,16);
                  SP++;
-                 H = dec2&0xFF;
+                 L = dec2&0xFF;
                  dec2 = strtol(memory[SP],NULL,16);
                  SP++;
-                 L = dec2&0xFF;
+                 H = dec2&0xFF;
         }
         else if(strcmp(memory[PC],"F1")==0){
                 unsigned int dec2 = strtol(memory[SP],NULL,16);
                 SP++;
-                A = dec2&0xFF;
+                flagRegister = dec2&0xFF;
                 dec2 = strtol(memory[SP],NULL,16);
                 SP++;
-                flagRegister = dec2&0xFF;
+                A = dec2&0xFF;
         }
             //for PUSH
         else if(strcmp(memory[PC],"C5")==0){
@@ -1103,7 +1503,7 @@ int main()
              A = A&0xFF;
         }
         //for SUB
-        else if(strcmp(memory[PC],"9F")==0) {
+        else if(strcmp(memory[PC],"97")==0) {
                 calculateAuxilaryCarry_sub(A,A);
                 A = A-A;
                 flagStatusUpdate(A);
@@ -1172,6 +1572,7 @@ int main()
         }
         //for XRA
         else if(strcmp(memory[PC],"AF")==0) {
+                AC = 0; CF = 0;
                 A = A^A;
                 flagStatusUpdate(A);
                 A = A&0xFF;
@@ -1182,21 +1583,25 @@ int main()
                 A = A&0xFF;
         }
         else  if(strcmp(memory[PC],"A9")==0) {
+                AC = 0; CF = 0;
                 A = A^C;
                 flagStatusUpdate(A);
                 A = A&0xFF;
         }
         else  if(strcmp(memory[PC],"AA")==0) {
+                AC = 0; CF = 0;
                 A = A^D;
                 flagStatusUpdate(A);
                 A = A&0xFF;
         }
         else  if(strcmp(memory[PC],"AB")==0) {
+                AC = 0; CF = 0;
                 A = A^E;
                 flagStatusUpdate(A);
                 A = A&0xFF;
         }
         else  if(strcmp(memory[PC],"AC")==0) {
+                AC = 0; CF = 0;
                 A = A^H;
                 flagStatusUpdate(A);
                 A = A&0xFF;
@@ -1207,6 +1612,7 @@ int main()
                 A = A&0xFF;
         }
         else  if(strcmp(memory[PC],"AE")==0){
+             AC = 0; CF = 0;
              char string[10];
              sprintf(string,"%02x%02x",H,L);          //combining two characters as string, H and L together stores address
              int dec = strtol(string,NULL,16);   //converting string to hex
@@ -1216,7 +1622,7 @@ int main()
              A = A&0xFF;
         }
         //for CMA
-        else if(strcmp(memory[PC],"2F")==0) A = ~A;
+        else if(strcmp(memory[PC],"2F")==0) A = (~A)&0xFF;
         //for CMC
         else if(strcmp(memory[PC],"3F")==0){
             if(CF == 1) CF = 0;
@@ -1242,18 +1648,16 @@ int main()
         }
         //for RAL
        else if(strcmp(memory[PC],"17")==0){           //rotate to left
-            A = (A<<1)+CF;
-            if((A&0x0100)==0x0100) CF = 1;
-            else CF = 0;
-            A = A&0xFF;                                     //since registers only the 8 bits, so we are typecasting to store first 8 bits alone
+            unsigned int oldCarry = CF;
+            CF = (A >> 7) & 0x01;
+            A = ((A << 1) | oldCarry) & 0xFF;               //since registers only the 8 bits, so we are typecasting to store first 8 bits alone
             flagRegister = (SF<<7)|(ZF<<6)|(AC<<4)|(PF<<2)|(CF);     //updating flag register
        }
        //for RAR
        else if(strcmp(memory[PC],"1F")==0){            //rotate to right
-            A = (A>>1)+(CF<<8);
-            if((A&0x0100)==0x0100) CF = 1;
-            else CF = 0;
-            A = A&0xFF;                     //since registers only the 8 bits, so we are typecasting to store first 8 bits alone
+            unsigned int oldCarry = CF;
+            CF = A & 0x01;
+            A = ((A >> 1) | (oldCarry << 7)) & 0xFF;
             flagRegister = (SF<<7)|(ZF<<6)|(AC<<4)|(PF<<2)|(CF);     //updating flag register
        }
        //for RLC
@@ -1314,12 +1718,21 @@ int main()
         sprintf(string,"%02x",tL);
         strcpy(memory[SP],string);
        }
+       //for RST instructions
+       else if(strcmp(memory[PC],"C7")==0){ push(PC+1); PC = 0x00-1; }
+       else if(strcmp(memory[PC],"CF")==0){ push(PC+1); PC = 0x08-1; }
+       else if(strcmp(memory[PC],"D7")==0){ push(PC+1); PC = 0x10-1; }
+       else if(strcmp(memory[PC],"DF")==0){ push(PC+1); PC = 0x18-1; }
+       else if(strcmp(memory[PC],"E7")==0){ push(PC+1); PC = 0x20-1; }
+       else if(strcmp(memory[PC],"EF")==0){ push(PC+1); PC = 0x28-1; }
+       else if(strcmp(memory[PC],"F7")==0){ push(PC+1); PC = 0x30-1; }
+       else if(strcmp(memory[PC],"FF")==0){ push(PC+1); PC = 0x38-1; }
        //for HLT
        else if(strcmp(memory[PC],"76")==0) break;            //ending the program
        //RET
        else if(strcmp(memory[PC],"C9")==0) pop();            //copying stack top to PC
        //PCHL
-       else if(strcmp(memory[PC],"E9")==0) PC = ((H<<8)&0xFF00)|(L&0x00FF);
+       else if(strcmp(memory[PC],"E9")==0) PC = (((H<<8)&0xFF00)|(L&0x00FF))-1;
        //RC
        else if(strcmp(memory[PC],"D8")==0) {
              if(CF==1) pop();
@@ -1446,7 +1859,7 @@ int main()
              char string[10];
              sprintf(string,"%02x%02x",H,L);
              int dec = strtol(string,NULL,16);
-             strcpy(memory[dec],memory[PC]);
+             strcpy(memory[dec],memory[PC+1]);
              PC++;
         }
         //ORI
@@ -1493,6 +1906,20 @@ int main()
              A = A&0xFF;
              AC = 0;
     }
+    //IN
+    else if(strcmp(memory[PC],"DB")==0){
+             unsigned int temp;
+             sscanf(memory[PC+1],"%x",&temp);
+             PC++;
+             A = (unsigned int)strtoul(ports[temp & 0xFF], NULL, 16) & 0xFF;
+    }
+    //OUT
+    else if(strcmp(memory[PC],"D3")==0){
+             unsigned int temp;
+             sscanf(memory[PC+1],"%x",&temp);
+             PC++;
+             sprintf(ports[temp & 0xFF], "%02x", A & 0xFF);
+    }
     //end of 1 byte operand instructions
     //LDA
     else if(strcmp(memory[PC],"3A")==0){
@@ -1530,9 +1957,9 @@ int main()
            PC +=2;
            strcat(strH,strL);
            sscanf(strH,"%x",&temp);
-           sprintf(memory[temp],"%x",L&0xFF);
+           sprintf(memory[temp],"%02X",L&0xFF);
            temp++;
-           sprintf(memory[temp],"%x",H&0xFF);
+           sprintf(memory[temp],"%02X",H&0xFF);
     }
     //STA
     else if(strcmp(memory[PC],"32")==0){               //storing accumulator contents to memory stored in operand_2byte
@@ -1543,7 +1970,7 @@ int main()
            PC +=2;
            strcat(strH,strL);
            sscanf(strH,"%x",&temp);
-           sprintf(memory[temp],"%x",A&0xFF);
+           sprintf(memory[temp],"%02X",A&0xFF);
     }
     //LXI
     else if(strcmp(memory[PC],"01")==0){
@@ -1712,10 +2139,12 @@ int main()
               strcpy(strL,memory[PC+1]);
               strcpy(strH,memory[PC+2]);
               PC +=2;
-              push(PC+1);               //pushing next address to stack
               strcat(strH,strL);
               sscanf(strH,"%x",&temp);
-              if(CF==1)PC = temp-1;
+              if(CF==1){
+                  push(PC+1);               //pushing next address to stack
+                  PC = temp-1;
+              }
      }
      //CM
      else if(strcmp(memory[PC],"FC")==0){
@@ -1724,10 +2153,12 @@ int main()
               strcpy(strL,memory[PC+1]);
               strcpy(strH,memory[PC+2]);
               PC +=2;
-              push(PC+1);               //pushing next address to stack
               strcat(strH,strL);
               sscanf(strH,"%x",&temp);
-              if(SF==1)PC = temp-1;
+              if(SF==1){
+                  push(PC+1);               //pushing next address to stack
+                  PC = temp-1;
+              }
      }
      //CNC
      else if(strcmp(memory[PC],"D4")==0){
@@ -1736,10 +2167,12 @@ int main()
               strcpy(strL,memory[PC+1]);
               strcpy(strH,memory[PC+2]);
               PC +=2;
-              push(PC+1);               //pushing next address to stack
               strcat(strH,strL);
               sscanf(strH,"%x",&temp);
-              if(CF==0)PC = temp-1;
+              if(CF==0){
+                  push(PC+1);               //pushing next address to stack
+                  PC = temp-1;
+              }
      }
      //CNZ
      else if(strcmp(memory[PC],"C4")==0){
@@ -1748,10 +2181,12 @@ int main()
               strcpy(strL,memory[PC+1]);
               strcpy(strH,memory[PC+2]);
               PC +=2;
-              push(PC+1);               //pushing next address to stack
               strcat(strH,strL);
               sscanf(strH,"%x",&temp);
-              if(ZF==0)PC = temp-1;
+              if(ZF==0){
+                  push(PC+1);               //pushing next address to stack
+                  PC = temp-1;
+              }
      }
      //CP
      else if(strcmp(memory[PC],"F4")==0){
@@ -1760,10 +2195,12 @@ int main()
               strcpy(strL,memory[PC+1]);
               strcpy(strH,memory[PC+2]);
               PC +=2;
-              push(PC+1);               //pushing next address to stack
               strcat(strH,strL);
               sscanf(strH,"%x",&temp);
-              if(SF==0)PC = temp-1;
+              if(SF==0){
+                  push(PC+1);               //pushing next address to stack
+                  PC = temp-1;
+              }
      }
      //CPE
      else if(strcmp(memory[PC],"EC")==0){
@@ -1772,10 +2209,12 @@ int main()
               strcpy(strL,memory[PC+1]);
               strcpy(strH,memory[PC+2]);
               PC +=2;
-              push(PC+1);               //pushing next address to stack
               strcat(strH,strL);
               sscanf(strH,"%x",&temp);
-              if(PF==1)PC = temp-1;
+              if(PF==1){
+                  push(PC+1);               //pushing next address to stack
+                  PC = temp-1;
+              }
      }
      //CPO
      else if(strcmp(memory[PC],"E4")==0){
@@ -1784,10 +2223,12 @@ int main()
               strcpy(strL,memory[PC+1]);
               strcpy(strH,memory[PC+2]);
               PC +=2;
-              push(PC+1);               //pushing next address to stack
               strcat(strH,strL);
               sscanf(strH,"%x",&temp);
-              if(PF==0)PC = temp-1;
+              if(PF==0){
+                  push(PC+1);               //pushing next address to stack
+                  PC = temp-1;
+              }
      }
      //CZ
      else if(strcmp(memory[PC],"CC")==0){
@@ -1796,18 +2237,20 @@ int main()
               strcpy(strL,memory[PC+1]);
               strcpy(strH,memory[PC+2]);
               PC +=2;
-              push(PC+1);               //pushing next address to stack
               strcat(strH,strL);
               sscanf(strH,"%x",&temp);
-              if(ZF==1)PC = temp-1;
+              if(ZF==1){
+                  push(PC+1);               //pushing next address to stack
+                  PC = temp-1;
+              }
      }
  }
     printf("\n---------------------------------------------------------------------------------------------------------");
     printf("\nFINAL STATUS OF REGISTERS\n");
     printf("---------------------------------------------------------------------------------------------------------\n");
     printf("A  ---> %02x\n",A); printf("B  ---> %02x\n",B); printf("C  ---> %02x\n",C); printf("D  ---> %02x\n",D);
-    printf("E  ---> %02x\n",E); printf("H  ---> %02x\n",H); printf("L  ---> %02x\n",L); printf("SP  ---> %02x\n",SP);
-    printf("PC  ---> %04x\n",PC);
+    printf("E  ---> %02x\n",E); printf("H  ---> %02x\n",H); printf("L  ---> %02x\n",L); printf("SP  ---> %04x\n",SP&0xFFFF);
+    printf("PC  ---> %04x\n",PC+1);
      printf("\n---------------------------------------------------------------------------------------------------------");
     printf("\nFINAL STATUS OF FLAGS\n");
      printf("---------------------------------------------------------------------------------------------------------\n");
@@ -1818,12 +2261,13 @@ int main()
      printf("---------------------------------------------------------------------------------------------------------\n");
     while(1)
     {
-         int h;
-         scanf("%04xH",&h);
-         if(h==-1) break;
-         else printf("%04x      %s\n",h,memory[h]);
+         char line[MAX_LINE_LENGTH];
+         unsigned int h;
+         if (fgets(line, sizeof(line), stdin) == NULL) break;
+         normalizeLine(line);
+         if(strcmp(line,"-1")==0) break;
+         if(parseValue(line, &h) && h < MEMORY_SIZE) printf("%04X      %s\n",h,memory[h]);
+         else printf("Invalid memory address. Try like 1004H or type -1.\n");
     }
+
 }
-
-
-
